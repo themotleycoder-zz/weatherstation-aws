@@ -1,0 +1,121 @@
+service: weather-api
+
+frameworkVersion: ">=1.2.0 <2.0.0"
+
+custom: ${{file(./env.yml)}}
+
+provider:
+  name: aws
+  runtime: nodejs6.10
+  stage: dev
+  variableSyntax: "\\${{([\\s\\S]+?)}}"
+  region: ${{self:custom.dev.REGION}}
+  iamRoleStatements: # permissions for all of your functions can be set here
+      - Effect: Allow
+        Action:
+          - dynamodb:GetItem
+          - dynamodb:GetRecords
+          - dynamodb:Query
+          - dynamodb:Scan
+        Resource: "arn:aws:dynamodb:${{self:custom.dev.REGION}}:${{self:custom.dev.ACCOUNTID}}:table/${{self:custom.dev.DBNAME}}"
+
+functions:
+  deviceCertActivation:
+      handler: src/iot/handler.handler
+
+  entries:
+    handler: src/entries/handler.handler
+    events:
+      - http:
+          path: weather/entries
+          method: get
+          cors: true
+  entry:
+    handler: src/entry/handler.handler
+    events:
+      - http:
+          path: weather/entry/{id}
+          method: get
+          cors: true
+          integration: lambda
+          request:
+            parameters:
+               paths:
+                 id: true
+
+resources:
+  Resources:
+    #create the dynamodb database
+    weatherDataTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${{self:custom.dev.DBNAME}}
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        ProvisionedThroughput:
+          ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+    #create the role/policy the IoT rule can use to access the database
+    iotDataRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${{self:custom.dev.IOTROLENAME}}
+        Path: "/service-role/"
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement: [ {
+            "Effect": "Allow",
+            "Principal": {
+               "Service": [ "iot.amazonaws.com" ]
+            },
+            "Action": [ "sts:AssumeRole" ]
+          } ]
+        Policies:
+          - PolicyName: ${{self:custom.dev.IOTROLENAME}}_policy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - dynamodb:PutItem
+                  Resource: arn:aws:dynamodb:${{self:custom.dev.REGION}}:${{self:custom.dev.ACCOUNTID}}:table/${{self:custom.dev.DBNAME}}
+    #create the IoT rule that processes device certs for new IoT devices
+    deviceCertRule:
+      Type: AWS::IoT::TopicRule
+      Properties:
+        RuleName: device_cert_rule
+        TopicRulePayload:
+          RuleDisabled: "true"
+          Sql: >-
+            SELECT * FROM '$aws/events/certificates/registered/${{self:custom.dev.CERTID}}'
+          Actions:
+            -
+              Lambda:
+                FunctionArn: arn:aws:lambda:${{self:custom.dev.REGION}}:${{self:custom.dev.ACCOUNTID}}:function:weather-api-dev-deviceCertActivation
+
+    #create the IoT rule that will process incoming requests and push them to the DB
+    iotRule:
+      Type: AWS::IoT::TopicRule
+      Properties:
+        RuleName: ${{self:custom.dev.IOTRULENAME}}
+        TopicRulePayload:
+          RuleDisabled: "true"
+          Sql: >-
+            SELECT * FROM 'device/update'
+          Actions:
+            -
+              DynamoDB:
+                TableName:
+                  Ref: weatherDataTable
+                RoleArn: "arn:aws:iam::${{self:custom.dev.ACCOUNTID}}:role/service-role/${{self:custom.dev.IOTROLENAME}}"
+                HashKeyField: id
+                HashKeyType: STRING
+                HashKeyValue: "${id}"
+                RangeKeyField: id
+                RangeKeyType: STRING
+                RangeKeyValue: "${id}"
+
